@@ -49,10 +49,10 @@ cargo run --release -- --list-checks
 
 ## Continuous mode + OLED (Argon ONE V5)
 
-Run checks continuously and render to the Argon ONE V5 OLED over I2C:
+OLED mode runs continuously and renders one check per page on the Argon ONE V5 OLED over I2C:
 
 ```bash
-cargo run --release -- --continuous --interval-secs 15 --oled
+cargo run --release -- --oled --interval-secs 15
 ```
 
 You can override the I2C bus or address if needed:
@@ -62,6 +62,7 @@ cargo run --release -- --oled --oled-i2c-bus /dev/i2c-1 --oled-i2c-addr 0x3c
 ```
 
 Defaults target the Argon ONE V5 OLED (SSD1306 128x64 at I2C address 0x3c).
+Press the Argon ONE V5 power button briefly to cycle to the next OLED page.
 
 ### Raspberry Pi (vcgencmd) check
 
@@ -96,8 +97,8 @@ are written under `/Library/Tailscale` as `ipnport` and `sameuserproof-<port>`.
 --ping-type <disco|tsmp|icmp|peerapi>  Ping type (defaults to disco)
 --check <ping|tailscale|disks|interfaces|system|vcgencmd|all>   Checks to run (defaults to all)
 --list-checks                         List available checks and exit
---continuous                          Run continuously and refresh output
---interval-secs <n>                   Poll interval for continuous mode (default 15)
+--continuous                          Run continuously and refresh output (forced when --oled)
+--interval-secs <n>                   Poll interval for continuous/OLED mode (default 15)
 --oled                                Render output to Argon ONE V5 OLED (I2C)
 --oled-i2c-bus <path>                 OLED I2C bus (default /dev/i2c-1)
 --oled-i2c-addr <addr>                OLED I2C address (default 0x3c)

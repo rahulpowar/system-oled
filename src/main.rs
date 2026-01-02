@@ -46,11 +46,11 @@ pub struct Args {
     #[arg(long)]
     list_checks: bool,
 
-    /// Run continuously and refresh output
+    /// Run continuously and refresh output (forced when --oled is set)
     #[arg(long)]
     continuous: bool,
 
-    /// Poll interval in seconds for continuous mode
+    /// Poll interval in seconds for continuous/OLED mode
     #[arg(long, default_value_t = 15)]
     interval_secs: u64,
 
@@ -195,6 +195,11 @@ fn init_oled(args: &Args) -> Result<Option<OledDisplay>> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn spawn_oled_button_watcher() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    None
+}
+
 async fn run_checks(
     checks: &[Box<dyn checks::Check>],
     ctx: &checks::CheckContext,
@@ -232,29 +237,89 @@ fn truncate_line(line: &str, max_cols: usize) -> String {
     out
 }
 
-fn build_oled_lines(outputs: &[checks::CheckOutput]) -> Vec<String> {
-    let mut lines = Vec::new();
+fn build_oled_pages(outputs: &[checks::CheckOutput]) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
     for output in outputs {
-        lines.push(format!("[{}]", output.title));
-        lines.extend(output.lines.iter().cloned());
-    }
-
-    let mut filtered = Vec::new();
-    for line in lines {
-        if filtered.len() >= OLED_MAX_LINES {
-            break;
+        let mut lines = Vec::new();
+        lines.push(truncate_line(&format!("[{}]", output.title), OLED_MAX_COLS));
+        for line in &output.lines {
+            if lines.len() >= OLED_MAX_LINES {
+                break;
+            }
+            let trimmed = truncate_line(line, OLED_MAX_COLS);
+            if !trimmed.is_empty() {
+                lines.push(trimmed);
+            }
         }
-        let trimmed = truncate_line(&line, OLED_MAX_COLS);
-        if !trimmed.is_empty() {
-            filtered.push(trimmed);
+        if lines.len() == 1 {
+            lines.push("no data".to_string());
+        }
+        pages.push(lines);
+    }
+
+    if pages.is_empty() {
+        pages.push(vec!["no data".to_string()]);
+    }
+
+    pages
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_oled_button_watcher() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        if let Err(err) = oled_button_loop(tx) {
+            eprintln!("OLED button watcher stopped: {err}");
+        }
+    });
+    Some(rx)
+}
+
+#[cfg(target_os = "linux")]
+fn oled_button_loop(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<()> {
+    use gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags};
+
+    const GPIO_LINE: u32 = 4;
+    const MIN_PRESS_MS: u64 = 100;
+    const MAX_PRESS_MS: u64 = 2000;
+    let chip_paths = ["/dev/gpiochip4", "/dev/gpiochip0"];
+
+    let mut handle = None;
+    for path in chip_paths {
+        if let Ok(mut chip) = Chip::new(path) {
+            if let Ok(line) = chip.get_line(GPIO_LINE) {
+                if let Ok(events) =
+                    line.events(LineRequestFlags::INPUT, EventRequestFlags::BOTH_EDGES, "system-oled")
+                {
+                    handle = Some(events);
+                    break;
+                }
+            }
         }
     }
 
-    if filtered.is_empty() {
-        filtered.push("no data".to_string());
-    }
+    let mut handle =
+        handle.ok_or_else(|| anyhow!("unable to open GPIO line {GPIO_LINE} for OLED button"))?;
+    let mut pressed_at: Option<std::time::Instant> = None;
 
-    filtered
+    loop {
+        let event = handle.get_event().context("read GPIO event")?;
+        match event.event_type() {
+            EventType::RisingEdge => {
+                pressed_at = Some(std::time::Instant::now());
+            }
+            EventType::FallingEdge => {
+                if let Some(start) = pressed_at.take() {
+                    let elapsed = start.elapsed();
+                    let ms = elapsed.as_millis() as u64;
+                    if ms >= MIN_PRESS_MS && ms <= MAX_PRESS_MS {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[tokio::main]
@@ -281,24 +346,71 @@ async fn main() -> Result<()> {
     let mut oled = init_oled(&args)?;
     let ctx = checks::CheckContext { args, localapi };
 
-    if ctx.args.continuous {
+    let force_continuous = ctx.args.continuous || oled.is_some();
+
+    if force_continuous {
         let interval = Duration::from_secs(ctx.args.interval_secs.max(1));
         let mut ticker = time::interval(interval);
+        let mut outputs = run_checks(&checks, &ctx).await?;
+        print_outputs(&outputs);
+        let mut pages = build_oled_pages(&outputs);
+        let mut page_idx = 0usize;
+        if let Some(oled) = oled.as_mut() {
+            oled.render_lines(&pages[page_idx])?;
+        }
+
+        let mut button_rx = if oled.is_some() {
+            spawn_oled_button_watcher()
+        } else {
+            None
+        };
+
         loop {
-            let outputs = run_checks(&checks, &ctx).await?;
-            print_outputs(&outputs);
-            if let Some(oled) = oled.as_mut() {
-                let oled_lines = build_oled_lines(&outputs);
-                oled.render_lines(&oled_lines)?;
+            if let Some(rx) = button_rx.as_mut() {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        outputs = run_checks(&checks, &ctx).await?;
+                        print_outputs(&outputs);
+                        pages = build_oled_pages(&outputs);
+                        if page_idx >= pages.len() {
+                            page_idx = 0;
+                        }
+                        if let Some(oled) = oled.as_mut() {
+                            oled.render_lines(&pages[page_idx])?;
+                        }
+                    }
+                    msg = rx.recv() => {
+                        if msg.is_none() {
+                            button_rx = None;
+                            continue;
+                        }
+                        if !pages.is_empty() {
+                            page_idx = (page_idx + 1) % pages.len();
+                            if let Some(oled) = oled.as_mut() {
+                                oled.render_lines(&pages[page_idx])?;
+                            }
+                        }
+                    }
+                }
+            } else {
+                ticker.tick().await;
+                outputs = run_checks(&checks, &ctx).await?;
+                print_outputs(&outputs);
+                pages = build_oled_pages(&outputs);
+                if page_idx >= pages.len() {
+                    page_idx = 0;
+                }
+                if let Some(oled) = oled.as_mut() {
+                    oled.render_lines(&pages[page_idx])?;
+                }
             }
-            ticker.tick().await;
         }
     } else {
         let outputs = run_checks(&checks, &ctx).await?;
         print_outputs(&outputs);
         if let Some(oled) = oled.as_mut() {
-            let oled_lines = build_oled_lines(&outputs);
-            oled.render_lines(&oled_lines)?;
+            let pages = build_oled_pages(&outputs);
+            oled.render_lines(&pages[0])?;
         }
     }
 
