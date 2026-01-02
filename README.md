@@ -33,11 +33,12 @@ By default all checks run. To run a subset:
 
 ```bash
 cargo run --release -- --check ping
+cargo run --release -- --check tailscale
 cargo run --release -- --check disks
 cargo run --release -- --check interfaces
 cargo run --release -- --check system
 cargo run --release -- --check vcgencmd
-cargo run --release -- --check ping,disks,interfaces,system,vcgencmd
+cargo run --release -- --check ping,tailscale,disks,interfaces,system,vcgencmd
 ```
 
 List available checks:
@@ -93,7 +94,7 @@ are written under `/Library/Tailscale` as `ipnport` and `sameuserproof-<port>`.
 
 ```
 --ping-type <disco|tsmp|icmp|peerapi>  Ping type (defaults to disco)
---check <ping|disks|interfaces|system|vcgencmd|all>   Checks to run (defaults to all)
+--check <ping|tailscale|disks|interfaces|system|vcgencmd|all>   Checks to run (defaults to all)
 --list-checks                         List available checks and exit
 --continuous                          Run continuously and refresh output
 --interval-secs <n>                   Poll interval for continuous mode (default 15)
