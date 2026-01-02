@@ -232,6 +232,16 @@ struct Status {
     peers: HashMap<String, PeerStatus>,
     #[serde(rename = "Self")]
     me: Option<PeerStatus>,
+    #[serde(rename = "MagicDNSSuffix", default)]
+    magic_dns_suffix: String,
+    #[serde(rename = "CurrentTailnet")]
+    current_tailnet: Option<TailnetStatus>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TailnetStatus {
+    #[serde(rename = "MagicDNSSuffix", default)]
+    magic_dns_suffix: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -447,6 +457,19 @@ impl Check for PingCheck {
         let timeout = Duration::from_secs(args.timeout_secs);
 
         let status = client.get_status(timeout).await.context("fetch status")?;
+        let tailnet_domain = status
+            .current_tailnet
+            .as_ref()
+            .map(|t| t.magic_dns_suffix.trim_end_matches('.').to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let legacy = status.magic_dns_suffix.trim_end_matches('.').to_string();
+                if legacy.is_empty() {
+                    None
+                } else {
+                    Some(legacy)
+                }
+            });
         let mut peers = Vec::new();
 
         for peer in status.peers.values() {
@@ -521,6 +544,9 @@ impl Check for PingCheck {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        if let Some(domain) = tailnet_domain {
+            lines.push(format!("tailnet: {}", domain));
+        }
         lines.push(format!(
             "{:<8}  {:<30}  {:<15}  {}",
             "latency", "peer", "ip", "path"
