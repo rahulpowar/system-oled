@@ -126,8 +126,9 @@ fn mailbox_get_temperature(fd: i32) -> Result<u32> {
 
 #[cfg(target_os = "linux")]
 fn mailbox_get_throttled(fd: i32) -> Result<u32> {
-    let mut value = [0xffffu32];
-    mailbox_property(fd, TAG_GET_THROTTLED, 0, &mut value)?;
+    let mut value = [0u32];
+    // GET_THROTTLED expects a 4-byte request buffer.
+    mailbox_property(fd, TAG_GET_THROTTLED, 4, &mut value)?;
     Ok(value[0])
 }
 
