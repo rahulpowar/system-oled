@@ -20,5 +20,5 @@ urlencoding = "2.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 embedded-graphics = "0.8"
-linux-embedded-hal = "0.4"
+linux-embedded-hal = "0.3"
 ssd1306 = "0.8"

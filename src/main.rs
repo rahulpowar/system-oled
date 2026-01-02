@@ -30,6 +30,8 @@ use serde::Deserialize;
 #[cfg(target_os = "linux")]
 use ssd1306::prelude::*;
 #[cfg(target_os = "linux")]
+use ssd1306::mode::BufferedGraphicsMode;
+#[cfg(target_os = "linux")]
 use ssd1306::I2CDisplayInterface;
 #[cfg(target_os = "linux")]
 use ssd1306::Ssd1306;
