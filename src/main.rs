@@ -33,7 +33,7 @@ use ssd1306::prelude::*;
 use ssd1306::I2CDisplayInterface;
 #[cfg(target_os = "linux")]
 use ssd1306::Ssd1306;
-use sysinfo::Disks;
+use sysinfo::{Disks, System};
 use tokio::sync::Semaphore;
 use tokio::time;
 use urlencoding::encode;
@@ -48,7 +48,7 @@ const OLED_MAX_LINES: usize = 6;
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Run system checks (Tailscale latency, disk usage, etc.)", version)]
 struct Args {
-    /// Checks to run (ping, disks, interfaces, vcgencmd). If omitted, runs all checks.
+    /// Checks to run (ping, disks, interfaces, system, vcgencmd). If omitted, runs all checks.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     check: Vec<String>,
 
@@ -657,6 +657,48 @@ impl Check for InterfaceCheck {
     }
 }
 
+struct SystemUsageCheck;
+
+#[async_trait]
+impl Check for SystemUsageCheck {
+    fn name(&self) -> &'static str {
+        "system"
+    }
+
+    async fn run(&self, _ctx: &CheckContext) -> Result<CheckOutput> {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.refresh_cpu();
+        time::sleep(Duration::from_millis(200)).await;
+        sys.refresh_cpu();
+        sys.refresh_memory();
+
+        let cpu = sys.global_cpu_info().cpu_usage();
+        let total_mem = sys.total_memory().saturating_mul(1024);
+        let used_mem = sys.used_memory().saturating_mul(1024);
+        let total_swap = sys.total_swap().saturating_mul(1024);
+        let used_swap = sys.used_swap().saturating_mul(1024);
+
+        let mut lines = Vec::new();
+        lines.push(format!("cpu: {:.1}%", cpu));
+        lines.push(format!(
+            "mem: {} / {}",
+            format_bytes(used_mem),
+            format_bytes(total_mem)
+        ));
+        lines.push(format!(
+            "swap: {} / {}",
+            format_bytes(used_swap),
+            format_bytes(total_swap)
+        ));
+
+        Ok(CheckOutput {
+            title: "System".to_string(),
+            lines,
+        })
+    }
+}
+
 struct VcgencmdCheck;
 
 #[async_trait]
@@ -865,6 +907,10 @@ fn available_checks() -> Vec<CheckInfo> {
             description: "Local IP addresses for all interfaces",
         },
         CheckInfo {
+            name: "system",
+            description: "CPU usage, memory, and swap",
+        },
+        CheckInfo {
             name: "vcgencmd",
             description: "Raspberry Pi firmware metrics (temp, throttling, clocks)",
         },
@@ -876,6 +922,7 @@ fn build_check(name: &str) -> Option<Box<dyn Check>> {
         "ping" => Some(Box::new(PingCheck)),
         "disks" => Some(Box::new(DiskUsageCheck)),
         "interfaces" | "ifaces" => Some(Box::new(InterfaceCheck)),
+        "system" | "cpu" | "mem" => Some(Box::new(SystemUsageCheck)),
         "vcgencmd" | "rpi" => Some(Box::new(VcgencmdCheck)),
         _ => None,
     }
@@ -887,6 +934,7 @@ fn selected_checks(args: &Args) -> Result<Vec<Box<dyn Check>>> {
             Box::new(PingCheck),
             Box::new(DiskUsageCheck),
             Box::new(InterfaceCheck),
+            Box::new(SystemUsageCheck),
             Box::new(VcgencmdCheck),
         ]);
     }
@@ -901,6 +949,7 @@ fn selected_checks(args: &Args) -> Result<Vec<Box<dyn Check>>> {
                 Box::new(PingCheck),
                 Box::new(DiskUsageCheck),
                 Box::new(InterfaceCheck),
+                Box::new(SystemUsageCheck),
                 Box::new(VcgencmdCheck),
             ]);
         }
