@@ -293,7 +293,6 @@ fn validate_oled_button_access() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn open_oled_button_handle() -> Result<gpio_cdev::LineEventHandle> {
-    use gpio_cdev::{Chip, EventRequestFlags, LineRequestFlags};
     use std::path::Path;
 
     const GPIO_LINE: u32 = 4;
@@ -362,7 +361,6 @@ fn oled_button_loop(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<()> {
                     }
                 }
             }
-            _ => {}
         }
     }
 }
@@ -377,16 +375,8 @@ fn try_open_button_line(
     let mut chip = Chip::new(path)?;
     let line = chip.get_line(line)?;
     let flags = LineRequestFlags::INPUT;
-    match line.events(flags, EventRequestFlags::BOTH_EDGES, "system-oled") {
-        Ok(handle) => Ok(handle),
-        Err(first) => {
-            let flags = LineRequestFlags::INPUT | LineRequestFlags::BIAS_PULL_UP;
-            match line.events(flags, EventRequestFlags::BOTH_EDGES, "system-oled") {
-                Ok(handle) => Ok(handle),
-                Err(_) => Err(first.into()),
-            }
-        }
-    }
+    line.events(flags, EventRequestFlags::BOTH_EDGES, "system-oled")
+        .map_err(|err| err.into())
 }
 
 #[tokio::main]
