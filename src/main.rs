@@ -470,6 +470,11 @@ impl Check for PingCheck {
                     Some(legacy)
                 }
             });
+        let device_domain = status
+            .me
+            .as_ref()
+            .map(|me| me.dns_name.trim_end_matches('.').to_string())
+            .filter(|s| !s.is_empty());
         let mut peers = Vec::new();
 
         for peer in status.peers.values() {
@@ -546,6 +551,9 @@ impl Check for PingCheck {
 
         if let Some(domain) = tailnet_domain {
             lines.push(format!("tailnet: {}", domain));
+        }
+        if let Some(device) = device_domain {
+            lines.push(format!("device: {}", device));
         }
         lines.push(format!(
             "{:<8}  {:<30}  {:<15}  {}",
@@ -811,6 +819,7 @@ struct MemoryStats {
 fn read_memory_stats(sys: &System) -> Result<MemoryStats> {
     #[cfg(target_os = "linux")]
     {
+        let _ = sys;
         return read_memory_stats_linux();
     }
     #[cfg(not(target_os = "linux"))]
@@ -935,31 +944,42 @@ fn mailbox_get_clock_measured(fd: i32, clock_id: u32) -> Result<u32> {
 
 #[cfg(target_os = "linux")]
 fn mailbox_property(fd: i32, tag: u32, request_len_bytes: u32, value: &mut [u32]) -> Result<()> {
-    let value_size_bytes = (value.len() * 4) as u32;
-    let mut buf: Vec<u32> = Vec::with_capacity(2 + 3 + value.len() + 1);
-    buf.push(0);
-    buf.push(0);
-    buf.push(tag);
-    buf.push(value_size_bytes);
-    buf.push(request_len_bytes);
-    buf.extend_from_slice(value);
-    buf.push(0);
-    buf[0] = (buf.len() * 4) as u32;
+    const MAX_WORDS: usize = 32;
+    #[repr(align(16))]
+    struct MailboxBuf {
+        data: [u32; MAX_WORDS],
+    }
 
-    let ret = unsafe { libc::ioctl(fd, ioctl_mbox_property(), buf.as_mut_ptr()) };
+    let value_size_bytes = (value.len() * 4) as u32;
+    let required_words = 2 + 3 + value.len() + 1;
+    let total_words = ((required_words + 3) / 4) * 4;
+    if total_words > MAX_WORDS {
+        return Err(anyhow!("mailbox buffer too large"));
+    }
+
+    let mut buf = MailboxBuf { data: [0; MAX_WORDS] };
+    buf.data[0] = (total_words * 4) as u32;
+    buf.data[1] = 0;
+    buf.data[2] = tag;
+    buf.data[3] = value_size_bytes;
+    buf.data[4] = request_len_bytes;
+    buf.data[5..5 + value.len()].copy_from_slice(value);
+    buf.data[5 + value.len()] = 0;
+
+    let ret = unsafe { libc::ioctl(fd, ioctl_mbox_property(), buf.data.as_mut_ptr()) };
     if ret < 0 {
         return Err(anyhow!(
             "mailbox ioctl failed: {}",
             std::io::Error::last_os_error()
         ));
     }
-    if (buf[1] & 0x8000_0000) == 0 {
-        return Err(anyhow!("mailbox response error: 0x{:08x}", buf[1]));
+    if (buf.data[1] & 0x8000_0000) == 0 {
+        return Err(anyhow!("mailbox response error: 0x{:08x}", buf.data[1]));
     }
 
     let value_start = 5;
     let value_end = value_start + value.len();
-    value.copy_from_slice(&buf[value_start..value_end]);
+    value.copy_from_slice(&buf.data[value_start..value_end]);
     Ok(())
 }
 
