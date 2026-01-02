@@ -7,7 +7,7 @@ use clap::Parser;
 use tokio::time;
 
 #[cfg(target_os = "linux")]
-use embedded_graphics::mono_font::ascii::FONT_6X10;
+use embedded_graphics::mono_font::ascii::FONT_5X8;
 #[cfg(target_os = "linux")]
 use embedded_graphics::mono_font::MonoTextStyle;
 #[cfg(target_os = "linux")]
@@ -33,8 +33,10 @@ mod tailscale;
 const DEFAULT_OLED_I2C_BUS: &str = "/dev/i2c-1";
 const DEFAULT_OLED_I2C_ADDR: &str = "0x3c";
 const DEFAULT_OLED_PAGE_SECS: u64 = 10;
-const OLED_MAX_COLS: usize = 21;
-const OLED_MAX_LINES: usize = 6;
+#[cfg(target_os = "linux")]
+const OLED_LINE_HEIGHT: i32 = 8;
+const OLED_MAX_COLS: usize = 25;
+const OLED_MAX_LINES: usize = 8;
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Run system checks (Tailscale latency, disk usage, etc.)", version)]
@@ -164,9 +166,9 @@ impl OledDisplay {
 
     fn render_lines(&mut self, lines: &[String]) -> Result<()> {
         self.display.clear_buffer();
-        let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+        let style = MonoTextStyle::new(&FONT_5X8, BinaryColor::On);
         for (idx, line) in lines.iter().take(OLED_MAX_LINES).enumerate() {
-            let y = (idx as i32) * 10;
+            let y = (idx as i32) * OLED_LINE_HEIGHT;
             Text::with_baseline(line, Point::new(0, y), style, Baseline::Top)
                 .draw(&mut self.display)
                 .map_err(|e| anyhow!("draw OLED text failed: {:?}", e))?;
@@ -250,21 +252,35 @@ fn truncate_line(line: &str, max_cols: usize) -> String {
 fn build_oled_pages(outputs: &[checks::CheckOutput]) -> Vec<Vec<String>> {
     let mut pages = Vec::new();
     for output in outputs {
-        let mut lines = Vec::new();
-        lines.push(truncate_line(&format!("[{}]", output.title), OLED_MAX_COLS));
-        for line in &output.lines {
-            if lines.len() >= OLED_MAX_LINES {
-                break;
-            }
-            let trimmed = truncate_line(line, OLED_MAX_COLS);
-            if !trimmed.is_empty() {
-                lines.push(trimmed);
-            }
+        let mut data_lines: Vec<String> = output
+            .lines
+            .iter()
+            .map(|line| truncate_line(line, OLED_MAX_COLS))
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        if data_lines.is_empty() {
+            data_lines.push("no data".to_string());
         }
-        if lines.len() == 1 {
-            lines.push("no data".to_string());
+
+        let chunk_size = OLED_MAX_LINES.saturating_sub(1).max(1);
+        let total_pages = (data_lines.len() + chunk_size - 1) / chunk_size;
+
+        for page_idx in 0..total_pages {
+            let mut lines = Vec::new();
+            let title = if total_pages > 1 {
+                format!("[{} {}/{}]", output.title, page_idx + 1, total_pages)
+            } else {
+                format!("[{}]", output.title)
+            };
+            lines.push(truncate_line(&title, OLED_MAX_COLS));
+            let start = page_idx * chunk_size;
+            let end = (start + chunk_size).min(data_lines.len());
+            for line in &data_lines[start..end] {
+                lines.push(line.clone());
+            }
+            pages.push(lines);
         }
-        pages.push(lines);
     }
 
     if pages.is_empty() {
