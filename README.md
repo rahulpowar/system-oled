@@ -63,7 +63,7 @@ cargo run --release -- --oled --oled-i2c-bus /dev/i2c-1 --oled-i2c-addr 0x3c
 
 Defaults target the Argon ONE V5 OLED (SSD1306 128x64 at I2C address 0x3c). Pages auto‑rotate
 every 10 seconds if you don’t press the button. Each check is split across multiple OLED pages
-if it exceeds the screen, and the OLED uses a smaller font to fit more lines.
+if it exceeds the screen, and long lines scroll horizontally instead of being truncated.
 To enable page switching with the Argon ONE V5 button:
 
 ```bash

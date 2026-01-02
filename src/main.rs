@@ -7,7 +7,7 @@ use clap::Parser;
 use tokio::time;
 
 #[cfg(target_os = "linux")]
-use embedded_graphics::mono_font::ascii::FONT_5X8;
+use embedded_graphics::mono_font::ascii::FONT_6X10;
 #[cfg(target_os = "linux")]
 use embedded_graphics::mono_font::MonoTextStyle;
 #[cfg(target_os = "linux")]
@@ -34,9 +34,11 @@ const DEFAULT_OLED_I2C_BUS: &str = "/dev/i2c-1";
 const DEFAULT_OLED_I2C_ADDR: &str = "0x3c";
 const DEFAULT_OLED_PAGE_SECS: u64 = 10;
 #[cfg(target_os = "linux")]
-const OLED_LINE_HEIGHT: i32 = 8;
-const OLED_MAX_COLS: usize = 25;
-const OLED_MAX_LINES: usize = 8;
+const OLED_LINE_HEIGHT: i32 = 10;
+const OLED_MAX_COLS: usize = 21;
+const OLED_MAX_LINES: usize = 6;
+const OLED_SCROLL_GAP: usize = 3;
+const DEFAULT_OLED_SCROLL_MS: u64 = 400;
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Run system checks (Tailscale latency, disk usage, etc.)", version)]
@@ -166,7 +168,7 @@ impl OledDisplay {
 
     fn render_lines(&mut self, lines: &[String]) -> Result<()> {
         self.display.clear_buffer();
-        let style = MonoTextStyle::new(&FONT_5X8, BinaryColor::On);
+        let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
         for (idx, line) in lines.iter().take(OLED_MAX_LINES).enumerate() {
             let y = (idx as i32) * OLED_LINE_HEIGHT;
             Text::with_baseline(line, Point::new(0, y), style, Baseline::Top)
@@ -235,18 +237,13 @@ fn print_outputs(outputs: &[checks::CheckOutput]) {
     }
 }
 
-fn truncate_line(line: &str, max_cols: usize) -> String {
+fn clean_oled_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    let len = trimmed.chars().count();
-    if len <= max_cols {
-        return trimmed.to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-    if max_cols <= 3 {
-        return trimmed.chars().take(max_cols).collect();
-    }
-    let mut out: String = trimmed.chars().take(max_cols - 3).collect();
-    out.push_str("...");
-    out
 }
 
 fn build_oled_pages(outputs: &[checks::CheckOutput]) -> Vec<Vec<String>> {
@@ -255,8 +252,7 @@ fn build_oled_pages(outputs: &[checks::CheckOutput]) -> Vec<Vec<String>> {
         let mut data_lines: Vec<String> = output
             .lines
             .iter()
-            .map(|line| truncate_line(line, OLED_MAX_COLS))
-            .filter(|line| !line.is_empty())
+            .filter_map(|line| clean_oled_line(line))
             .collect();
 
         if data_lines.is_empty() {
@@ -273,7 +269,7 @@ fn build_oled_pages(outputs: &[checks::CheckOutput]) -> Vec<Vec<String>> {
             } else {
                 format!("[{}]", output.title)
             };
-            lines.push(truncate_line(&title, OLED_MAX_COLS));
+            lines.push(title);
             let start = page_idx * chunk_size;
             let end = (start + chunk_size).min(data_lines.len());
             for line in &data_lines[start..end] {
@@ -288,6 +284,36 @@ fn build_oled_pages(outputs: &[checks::CheckOutput]) -> Vec<Vec<String>> {
     }
 
     pages
+}
+
+fn line_needs_scroll(line: &str) -> bool {
+    line.chars().count() > OLED_MAX_COLS
+}
+
+fn page_needs_scroll(lines: &[String]) -> bool {
+    lines.iter().any(|line| line_needs_scroll(line))
+}
+
+fn build_oled_visible_lines(lines: &[String], scroll_offset: usize) -> Vec<String> {
+    let mut visible = Vec::with_capacity(lines.len());
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let len = chars.len();
+        if len <= OLED_MAX_COLS {
+            visible.push(line.clone());
+            continue;
+        }
+        let total = len + OLED_SCROLL_GAP;
+        let start = scroll_offset % total;
+        let mut out = String::new();
+        for i in 0..OLED_MAX_COLS {
+            let idx = (start + i) % total;
+            let ch = if idx < len { chars[idx] } else { ' ' };
+            out.push(ch);
+        }
+        visible.push(out);
+    }
+    visible
 }
 
 #[cfg(target_os = "linux")]
@@ -427,12 +453,18 @@ async fn main() -> Result<()> {
         let page_interval = Duration::from_secs(DEFAULT_OLED_PAGE_SECS);
         let mut page_ticker =
             time::interval_at(time::Instant::now() + page_interval, page_interval);
+        let scroll_interval = Duration::from_millis(DEFAULT_OLED_SCROLL_MS);
+        let mut scroll_ticker =
+            time::interval_at(time::Instant::now() + scroll_interval, scroll_interval);
         let mut outputs = run_checks(&checks, &ctx).await?;
         print_outputs(&outputs);
         let mut pages = build_oled_pages(&outputs);
         let mut page_idx = 0usize;
+        let mut scroll_offset = 0usize;
+        let mut scroll_enabled = page_needs_scroll(&pages[page_idx]);
         if let Some(oled) = oled.as_mut() {
-            oled.render_lines(&pages[page_idx])?;
+            let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+            oled.render_lines(&visible)?;
         }
 
         if ctx.args.oled_button && oled.is_some() {
@@ -454,14 +486,29 @@ async fn main() -> Result<()> {
                         if page_idx >= pages.len() {
                             page_idx = 0;
                         }
+                        scroll_offset = 0;
+                        scroll_enabled = page_needs_scroll(&pages[page_idx]);
                         if let Some(oled) = oled.as_mut() {
-                            oled.render_lines(&pages[page_idx])?;
+                            let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+                            oled.render_lines(&visible)?;
                         }
+                        scroll_ticker = time::interval_at(time::Instant::now() + scroll_interval, scroll_interval);
                     }
                     _ = page_ticker.tick(), if oled.is_some() && pages.len() > 1 => {
                         page_idx = (page_idx + 1) % pages.len();
+                        scroll_offset = 0;
+                        scroll_enabled = page_needs_scroll(&pages[page_idx]);
                         if let Some(oled) = oled.as_mut() {
-                            oled.render_lines(&pages[page_idx])?;
+                            let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+                            oled.render_lines(&visible)?;
+                        }
+                        scroll_ticker = time::interval_at(time::Instant::now() + scroll_interval, scroll_interval);
+                    }
+                    _ = scroll_ticker.tick(), if oled.is_some() && scroll_enabled => {
+                        scroll_offset = scroll_offset.saturating_add(1);
+                        if let Some(oled) = oled.as_mut() {
+                            let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+                            oled.render_lines(&visible)?;
                         }
                     }
                     msg = rx.recv() => {
@@ -471,9 +518,13 @@ async fn main() -> Result<()> {
                         }
                         if !pages.is_empty() {
                             page_idx = (page_idx + 1) % pages.len();
+                            scroll_offset = 0;
+                            scroll_enabled = page_needs_scroll(&pages[page_idx]);
                             if let Some(oled) = oled.as_mut() {
-                                oled.render_lines(&pages[page_idx])?;
+                                let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+                                oled.render_lines(&visible)?;
                             }
+                            scroll_ticker = time::interval_at(time::Instant::now() + scroll_interval, scroll_interval);
                             page_ticker = time::interval_at(time::Instant::now() + page_interval, page_interval);
                         }
                     }
@@ -487,14 +538,29 @@ async fn main() -> Result<()> {
                         if page_idx >= pages.len() {
                             page_idx = 0;
                         }
+                        scroll_offset = 0;
+                        scroll_enabled = page_needs_scroll(&pages[page_idx]);
                         if let Some(oled) = oled.as_mut() {
-                            oled.render_lines(&pages[page_idx])?;
+                            let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+                            oled.render_lines(&visible)?;
                         }
+                        scroll_ticker = time::interval_at(time::Instant::now() + scroll_interval, scroll_interval);
                     }
                     _ = page_ticker.tick(), if oled.is_some() && pages.len() > 1 => {
                         page_idx = (page_idx + 1) % pages.len();
+                        scroll_offset = 0;
+                        scroll_enabled = page_needs_scroll(&pages[page_idx]);
                         if let Some(oled) = oled.as_mut() {
-                            oled.render_lines(&pages[page_idx])?;
+                            let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+                            oled.render_lines(&visible)?;
+                        }
+                        scroll_ticker = time::interval_at(time::Instant::now() + scroll_interval, scroll_interval);
+                    }
+                    _ = scroll_ticker.tick(), if oled.is_some() && scroll_enabled => {
+                        scroll_offset = scroll_offset.saturating_add(1);
+                        if let Some(oled) = oled.as_mut() {
+                            let visible = build_oled_visible_lines(&pages[page_idx], scroll_offset);
+                            oled.render_lines(&visible)?;
                         }
                     }
                 }
