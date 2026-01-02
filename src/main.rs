@@ -382,8 +382,12 @@ impl OledDisplay {
         let interface = I2CDisplayInterface::new(i2c);
         let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
             .into_buffered_graphics_mode();
-        display.init().context("init OLED")?;
-        display.flush().context("flush OLED")?;
+        display
+            .init()
+            .map_err(|e| anyhow!("init OLED failed: {:?}", e))?;
+        display
+            .flush()
+            .map_err(|e| anyhow!("flush OLED failed: {:?}", e))?;
         Ok(Self { display })
     }
 
@@ -394,9 +398,11 @@ impl OledDisplay {
             let y = (idx as i32) * 10;
             Text::with_baseline(line, Point::new(0, y), style, Baseline::Top)
                 .draw(&mut self.display)
-                .context("draw OLED text")?;
+                .map_err(|e| anyhow!("draw OLED text failed: {:?}", e))?;
         }
-        self.display.flush().context("flush OLED")?;
+        self.display
+            .flush()
+            .map_err(|e| anyhow!("flush OLED failed: {:?}", e))?;
         Ok(())
     }
 }
