@@ -675,29 +675,25 @@ impl Check for SystemUsageCheck {
 
     async fn run(&self, _ctx: &CheckContext) -> Result<CheckOutput> {
         let mut sys = System::new();
-        sys.refresh_memory();
         sys.refresh_cpu();
         time::sleep(Duration::from_millis(200)).await;
         sys.refresh_cpu();
         sys.refresh_memory();
 
         let cpu = sys.global_cpu_info().cpu_usage();
-        let total_mem = sys.total_memory().saturating_mul(1024);
-        let used_mem = sys.used_memory().saturating_mul(1024);
-        let total_swap = sys.total_swap().saturating_mul(1024);
-        let used_swap = sys.used_swap().saturating_mul(1024);
+        let mem = read_memory_stats(&sys)?;
 
         let mut lines = Vec::new();
         lines.push(format!("cpu: {:.1}%", cpu));
         lines.push(format!(
             "mem: {} / {}",
-            format_bytes(used_mem),
-            format_bytes(total_mem)
+            format_bytes(mem.used_bytes),
+            format_bytes(mem.total_bytes)
         ));
         lines.push(format!(
             "swap: {} / {}",
-            format_bytes(used_swap),
-            format_bytes(total_swap)
+            format_bytes(mem.swap_used_bytes),
+            format_bytes(mem.swap_total_bytes)
         ));
 
         Ok(CheckOutput {
@@ -778,6 +774,78 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+#[derive(Clone, Debug)]
+struct MemoryStats {
+    total_bytes: u64,
+    used_bytes: u64,
+    swap_total_bytes: u64,
+    swap_used_bytes: u64,
+}
+
+fn read_memory_stats(sys: &System) -> Result<MemoryStats> {
+    #[cfg(target_os = "linux")]
+    {
+        return read_memory_stats_linux();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let total_bytes = sys.total_memory();
+        let used_bytes = sys.used_memory();
+        let swap_total_bytes = sys.total_swap();
+        let swap_used_bytes = sys.used_swap();
+        return Ok(MemoryStats {
+            total_bytes,
+            used_bytes,
+            swap_total_bytes,
+            swap_used_bytes,
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_memory_stats_linux() -> Result<MemoryStats> {
+    let content = std::fs::read_to_string("/proc/meminfo").context("read /proc/meminfo")?;
+    let mut mem_total_kb = None;
+    let mut mem_available_kb = None;
+    let mut mem_free_kb = None;
+    let mut swap_total_kb = None;
+    let mut swap_free_kb = None;
+
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let key = parts
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(':');
+        let value = match parts.next() {
+            Some(v) => v.parse::<u64>().ok(),
+            None => None,
+        };
+        match (key, value) {
+            ("MemTotal", Some(v)) => mem_total_kb = Some(v),
+            ("MemAvailable", Some(v)) => mem_available_kb = Some(v),
+            ("MemFree", Some(v)) => mem_free_kb = Some(v),
+            ("SwapTotal", Some(v)) => swap_total_kb = Some(v),
+            ("SwapFree", Some(v)) => swap_free_kb = Some(v),
+            _ => {}
+        }
+    }
+
+    let total_kb = mem_total_kb.ok_or_else(|| anyhow!("MemTotal not found"))?;
+    let available_kb = mem_available_kb.or(mem_free_kb).unwrap_or(0);
+    let used_kb = total_kb.saturating_sub(available_kb);
+    let swap_total_kb = swap_total_kb.unwrap_or(0);
+    let swap_free_kb = swap_free_kb.unwrap_or(0);
+    let swap_used_kb = swap_total_kb.saturating_sub(swap_free_kb);
+
+    Ok(MemoryStats {
+        total_bytes: total_kb.saturating_mul(1024),
+        used_bytes: used_kb.saturating_mul(1024),
+        swap_total_bytes: swap_total_kb.saturating_mul(1024),
+        swap_used_bytes: swap_used_kb.saturating_mul(1024),
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn read_rpi_metrics() -> Result<RpiMetrics> {
     use std::fs::OpenOptions;
@@ -828,7 +896,7 @@ fn mailbox_get_temperature(fd: i32) -> Result<u32> {
 #[cfg(target_os = "linux")]
 fn mailbox_get_throttled(fd: i32) -> Result<u32> {
     let mut value = [0xffffu32];
-    mailbox_property(fd, TAG_GET_THROTTLED, 4, &mut value)?;
+    mailbox_property(fd, TAG_GET_THROTTLED, 0, &mut value)?;
     Ok(value[0])
 }
 
@@ -874,7 +942,6 @@ fn ioctl_mbox_property() -> libc::c_ulong {
     const IOC_NRBITS: u32 = 8;
     const IOC_TYPEBITS: u32 = 8;
     const IOC_SIZEBITS: u32 = 14;
-    const IOC_DIRBITS: u32 = 2;
 
     const IOC_NRSHIFT: u32 = 0;
     const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + IOC_NRBITS;
