@@ -61,8 +61,15 @@ You can override the I2C bus or address if needed:
 cargo run --release -- --oled --oled-i2c-bus /dev/i2c-1 --oled-i2c-addr 0x3c
 ```
 
-Defaults target the Argon ONE V5 OLED (SSD1306 128x64 at I2C address 0x3c).
-Press the Argon ONE V5 power button briefly to cycle to the next OLED page.
+Defaults target the Argon ONE V5 OLED (SSD1306 128x64 at I2C address 0x3c). Pages auto‑rotate
+every 10 seconds if you don’t press the button.
+To enable page switching with the Argon ONE V5 button:
+
+```bash
+cargo run --release -- --oled --oled-button
+```
+Enable `--oled-button` to use the Argon ONE V5 power button to cycle pages. This exits with an
+error if the GPIO line is not accessible (for example, if argononeoledd/argononed owns the line).
 
 ### Raspberry Pi (vcgencmd) check
 
@@ -100,6 +107,7 @@ are written under `/Library/Tailscale` as `ipnport` and `sameuserproof-<port>`.
 --continuous                          Run continuously and refresh output (forced when --oled)
 --interval-secs <n>                   Poll interval for continuous/OLED mode (default 15)
 --oled                                Render output to Argon ONE V5 OLED (I2C)
+--oled-button                         Enable Argon ONE V5 button to cycle OLED pages
 --oled-i2c-bus <path>                 OLED I2C bus (default /dev/i2c-1)
 --oled-i2c-addr <addr>                OLED I2C address (default 0x3c)
 --size <bytes>                        Optional ping payload size

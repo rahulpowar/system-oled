@@ -32,6 +32,7 @@ mod tailscale;
 
 const DEFAULT_OLED_I2C_BUS: &str = "/dev/i2c-1";
 const DEFAULT_OLED_I2C_ADDR: &str = "0x3c";
+const DEFAULT_OLED_PAGE_SECS: u64 = 10;
 const OLED_MAX_COLS: usize = 21;
 const OLED_MAX_LINES: usize = 6;
 
@@ -57,6 +58,10 @@ pub struct Args {
     /// Render output to the Argon ONE V5 OLED (I2C)
     #[arg(long)]
     oled: bool,
+
+    /// Enable Argon ONE V5 button to cycle OLED pages (Linux only)
+    #[arg(long)]
+    oled_button: bool,
 
     /// I2C bus for OLED (Raspberry Pi)
     #[arg(long, default_value = DEFAULT_OLED_I2C_BUS)]
@@ -196,8 +201,13 @@ fn init_oled(args: &Args) -> Result<Option<OledDisplay>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn spawn_oled_button_watcher() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
-    None
+fn spawn_oled_button_watcher() -> Result<Option<tokio::sync::mpsc::UnboundedReceiver<()>>> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_oled_button_access() -> Result<()> {
+    Err(anyhow!("OLED button support requires Linux"))
 }
 
 async fn run_checks(
@@ -265,41 +275,76 @@ fn build_oled_pages(outputs: &[checks::CheckOutput]) -> Vec<Vec<String>> {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_oled_button_watcher() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+fn spawn_oled_button_watcher() -> Result<Option<tokio::sync::mpsc::UnboundedReceiver<()>>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         if let Err(err) = oled_button_loop(tx) {
             eprintln!("OLED button watcher stopped: {err}");
         }
     });
-    Some(rx)
+    Ok(Some(rx))
 }
 
 #[cfg(target_os = "linux")]
-fn oled_button_loop(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<()> {
-    use gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags};
+fn validate_oled_button_access() -> Result<()> {
+    let _ = open_oled_button_handle()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_oled_button_handle() -> Result<gpio_cdev::LineEventHandle> {
+    use gpio_cdev::{Chip, EventRequestFlags, LineRequestFlags};
+    use std::path::Path;
 
     const GPIO_LINE: u32 = 4;
-    const MIN_PRESS_MS: u64 = 100;
-    const MAX_PRESS_MS: u64 = 2000;
-    let chip_paths = ["/dev/gpiochip4", "/dev/gpiochip0"];
-
-    let mut handle = None;
-    for path in chip_paths {
-        if let Ok(mut chip) = Chip::new(path) {
-            if let Ok(line) = chip.get_line(GPIO_LINE) {
-                if let Ok(events) =
-                    line.events(LineRequestFlags::INPUT, EventRequestFlags::BOTH_EDGES, "system-oled")
-                {
-                    handle = Some(events);
-                    break;
+    let mut chip_paths: Vec<String> = Vec::new();
+    for path in ["/dev/gpiochip4", "/dev/gpiochip0"] {
+        if Path::new(path).exists() {
+            chip_paths.push(path.to_string());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        let mut extra = Vec::new();
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("gpiochip") {
+                    extra.push(format!("/dev/{name}"));
                 }
+            }
+        }
+        extra.sort();
+        for path in extra {
+            if !chip_paths.contains(&path) {
+                chip_paths.push(path);
             }
         }
     }
 
-    let mut handle =
-        handle.ok_or_else(|| anyhow!("unable to open GPIO line {GPIO_LINE} for OLED button"))?;
+    let mut errors = Vec::new();
+    for path in &chip_paths {
+        match try_open_button_line(path, GPIO_LINE) {
+            Ok(events) => return Ok(events),
+            Err(err) => errors.push(format!("{path}: {err}")),
+        }
+    }
+
+    let detail = if errors.is_empty() {
+        "no gpiochip devices found".to_string()
+    } else {
+        errors.join("; ")
+    };
+    Err(anyhow!(
+        "unable to open GPIO line {GPIO_LINE} for OLED button ({detail}). If the Argon daemon is running, it may already own the line (stop argononeoledd/argononed to enable button cycling)."
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn oled_button_loop(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<()> {
+    use gpio_cdev::EventType;
+
+    let mut handle = open_oled_button_handle()?;
+    const MIN_PRESS_MS: u64 = 100;
+    const MAX_PRESS_MS: u64 = 2000;
     let mut pressed_at: Option<std::time::Instant> = None;
 
     loop {
@@ -318,6 +363,28 @@ fn oled_button_loop(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<()> {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_open_button_line(
+    path: &str,
+    line: u32,
+) -> Result<gpio_cdev::LineEventHandle> {
+    use gpio_cdev::{Chip, EventRequestFlags, LineRequestFlags};
+
+    let mut chip = Chip::new(path)?;
+    let line = chip.get_line(line)?;
+    let flags = LineRequestFlags::INPUT;
+    match line.events(flags, EventRequestFlags::BOTH_EDGES, "system-oled") {
+        Ok(handle) => Ok(handle),
+        Err(first) => {
+            let flags = LineRequestFlags::INPUT | LineRequestFlags::BIAS_PULL_UP;
+            match line.events(flags, EventRequestFlags::BOTH_EDGES, "system-oled") {
+                Ok(handle) => Ok(handle),
+                Err(_) => Err(first.into()),
+            }
         }
     }
 }
@@ -351,6 +418,9 @@ async fn main() -> Result<()> {
     if force_continuous {
         let interval = Duration::from_secs(ctx.args.interval_secs.max(1));
         let mut ticker = time::interval(interval);
+        let page_interval = Duration::from_secs(DEFAULT_OLED_PAGE_SECS);
+        let mut page_ticker =
+            time::interval_at(time::Instant::now() + page_interval, page_interval);
         let mut outputs = run_checks(&checks, &ctx).await?;
         print_outputs(&outputs);
         let mut pages = build_oled_pages(&outputs);
@@ -359,8 +429,11 @@ async fn main() -> Result<()> {
             oled.render_lines(&pages[page_idx])?;
         }
 
-        let mut button_rx = if oled.is_some() {
-            spawn_oled_button_watcher()
+        if ctx.args.oled_button && oled.is_some() {
+            validate_oled_button_access()?;
+        }
+        let mut button_rx = if oled.is_some() && ctx.args.oled_button {
+            spawn_oled_button_watcher()?
         } else {
             None
         };
@@ -379,6 +452,12 @@ async fn main() -> Result<()> {
                             oled.render_lines(&pages[page_idx])?;
                         }
                     }
+                    _ = page_ticker.tick(), if oled.is_some() && pages.len() > 1 => {
+                        page_idx = (page_idx + 1) % pages.len();
+                        if let Some(oled) = oled.as_mut() {
+                            oled.render_lines(&pages[page_idx])?;
+                        }
+                    }
                     msg = rx.recv() => {
                         if msg.is_none() {
                             button_rx = None;
@@ -389,19 +468,29 @@ async fn main() -> Result<()> {
                             if let Some(oled) = oled.as_mut() {
                                 oled.render_lines(&pages[page_idx])?;
                             }
+                            page_ticker = time::interval_at(time::Instant::now() + page_interval, page_interval);
                         }
                     }
                 }
             } else {
-                ticker.tick().await;
-                outputs = run_checks(&checks, &ctx).await?;
-                print_outputs(&outputs);
-                pages = build_oled_pages(&outputs);
-                if page_idx >= pages.len() {
-                    page_idx = 0;
-                }
-                if let Some(oled) = oled.as_mut() {
-                    oled.render_lines(&pages[page_idx])?;
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        outputs = run_checks(&checks, &ctx).await?;
+                        print_outputs(&outputs);
+                        pages = build_oled_pages(&outputs);
+                        if page_idx >= pages.len() {
+                            page_idx = 0;
+                        }
+                        if let Some(oled) = oled.as_mut() {
+                            oled.render_lines(&pages[page_idx])?;
+                        }
+                    }
+                    _ = page_ticker.tick(), if oled.is_some() && pages.len() > 1 => {
+                        page_idx = (page_idx + 1) % pages.len();
+                        if let Some(oled) = oled.as_mut() {
+                            oled.render_lines(&pages[page_idx])?;
+                        }
+                    }
                 }
             }
         }
