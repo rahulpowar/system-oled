@@ -9,12 +9,30 @@ use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine;
 use clap::Parser;
+#[cfg(target_os = "linux")]
+use embedded_graphics::mono_font::ascii::FONT_6X10;
+#[cfg(target_os = "linux")]
+use embedded_graphics::mono_font::MonoTextStyle;
+#[cfg(target_os = "linux")]
+use embedded_graphics::pixelcolor::BinaryColor;
+#[cfg(target_os = "linux")]
+use embedded_graphics::prelude::*;
+#[cfg(target_os = "linux")]
+use embedded_graphics::text::{Baseline, Text};
 use get_if_addrs::{get_if_addrs, IfAddr};
 use hyper::body::to_bytes;
 use hyper::header::{ACCEPT, AUTHORIZATION, HOST};
 use hyper::{Body, Client, Method, Request, StatusCode};
 use hyperlocal::{UnixClientExt, UnixConnector};
+#[cfg(target_os = "linux")]
+use linux_embedded_hal::I2cdev;
 use serde::Deserialize;
+#[cfg(target_os = "linux")]
+use ssd1306::prelude::*;
+#[cfg(target_os = "linux")]
+use ssd1306::I2CDisplayInterface;
+#[cfg(target_os = "linux")]
+use ssd1306::Ssd1306;
 use sysinfo::Disks;
 use tokio::sync::Semaphore;
 use tokio::time;
@@ -22,6 +40,10 @@ use urlencoding::encode;
 
 const LOCALAPI_HOST: &str = "local-tailscaled.sock";
 const DEFAULT_LINUX_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
+const DEFAULT_OLED_I2C_BUS: &str = "/dev/i2c-1";
+const DEFAULT_OLED_I2C_ADDR: &str = "0x3c";
+const OLED_MAX_COLS: usize = 21;
+const OLED_MAX_LINES: usize = 6;
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Run system checks (Tailscale latency, disk usage, etc.)", version)]
@@ -33,6 +55,26 @@ struct Args {
     /// List available checks and exit
     #[arg(long)]
     list_checks: bool,
+
+    /// Run continuously and refresh output
+    #[arg(long)]
+    continuous: bool,
+
+    /// Poll interval in seconds for continuous mode
+    #[arg(long, default_value_t = 15)]
+    interval_secs: u64,
+
+    /// Render output to the Argon ONE V5 OLED (I2C)
+    #[arg(long)]
+    oled: bool,
+
+    /// I2C bus for OLED (Raspberry Pi)
+    #[arg(long, default_value = DEFAULT_OLED_I2C_BUS)]
+    oled_i2c_bus: String,
+
+    /// I2C address for OLED (hex or decimal)
+    #[arg(long, default_value = DEFAULT_OLED_I2C_ADDR)]
+    oled_i2c_addr: String,
 
     /// Ping type: disco, tsmp, icmp, peerapi
     #[arg(long, default_value = "disco")]
@@ -293,6 +335,92 @@ struct CheckContext {
     localapi: Option<LocalApiClient>,
 }
 
+#[cfg(target_os = "linux")]
+struct OledConfig {
+    bus: String,
+    addr: u16,
+}
+
+#[cfg(target_os = "linux")]
+struct OledDisplay {
+    display: Ssd1306<
+        I2CInterface<I2cdev>,
+        DisplaySize128x64,
+        BufferedGraphicsMode<DisplaySize128x64>,
+    >,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct OledDisplay;
+
+#[cfg(target_os = "linux")]
+fn parse_i2c_addr(input: &str) -> Result<u16> {
+    let trimmed = input.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).context("parse hex i2c address")
+    } else {
+        trimmed.parse::<u16>().context("parse i2c address")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn oled_config_from_args(args: &Args) -> Result<OledConfig> {
+    Ok(OledConfig {
+        bus: args.oled_i2c_bus.clone(),
+        addr: parse_i2c_addr(&args.oled_i2c_addr)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl OledDisplay {
+    fn new(config: &OledConfig) -> Result<Self> {
+        let mut i2c = I2cdev::new(&config.bus).context("open I2C bus")?;
+        i2c.set_slave_address(config.addr)
+            .context("set OLED I2C address")?;
+        let interface = I2CDisplayInterface::new(i2c);
+        let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+            .into_buffered_graphics_mode();
+        display.init().context("init OLED")?;
+        display.flush().context("flush OLED")?;
+        Ok(Self { display })
+    }
+
+    fn render_lines(&mut self, lines: &[String]) -> Result<()> {
+        self.display.clear_buffer();
+        let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+        for (idx, line) in lines.iter().take(OLED_MAX_LINES).enumerate() {
+            let y = (idx as i32) * 10;
+            Text::with_baseline(line, Point::new(0, y), style, Baseline::Top)
+                .draw(&mut self.display)
+                .context("draw OLED text")?;
+        }
+        self.display.flush().context("flush OLED")?;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OledDisplay {
+    fn render_lines(&mut self, _lines: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn init_oled(args: &Args) -> Result<Option<OledDisplay>> {
+    if !args.oled {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let config = oled_config_from_args(args)?;
+        return Ok(Some(OledDisplay::new(&config)?));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(anyhow!("OLED output is only supported on Linux"))
+    }
+}
+
 struct PingCheck;
 
 #[async_trait]
@@ -500,8 +628,8 @@ impl Check for InterfaceCheck {
 
         let mut lines = Vec::new();
         lines.push(format!(
-            "{:<12}  {:<5}  {:<39}  {:<39}  {}",
-            "iface", "type", "address", "netmask", "flags"
+            "{:<12}  {:<5}  {:<39}  {}",
+            "iface", "type", "address", "netmask"
         ));
 
         for iface in ifaces {
@@ -512,15 +640,9 @@ impl Check for InterfaceCheck {
                 IfAddr::V4(v4) => ("ipv4", v4.ip.to_string(), v4.netmask.to_string()),
                 IfAddr::V6(v6) => ("ipv6", v6.ip.to_string(), v6.netmask.to_string()),
             };
-            let mut flags = Vec::new();
-            let flag_text = if flags.is_empty() {
-                "-".to_string()
-            } else {
-                flags.join(",")
-            };
             lines.push(format!(
-                "{:<12}  {:<5}  {:<39}  {:<39}  {}",
-                iface.name, family, ip, mask, flag_text
+                "{:<12}  {:<5}  {:<39}  {}",
+                iface.name, family, ip, mask
             ));
         }
 
@@ -808,6 +930,65 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+async fn run_checks(checks: &[Box<dyn Check>], ctx: &CheckContext) -> Result<Vec<CheckOutput>> {
+    let mut outputs = Vec::with_capacity(checks.len());
+    for check in checks {
+        outputs.push(check.run(ctx).await?);
+    }
+    Ok(outputs)
+}
+
+fn print_outputs(outputs: &[CheckOutput]) {
+    for (idx, output) in outputs.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+        println!("== {} ==", output.title);
+        for line in &output.lines {
+            println!("{}", line);
+        }
+    }
+}
+
+fn truncate_line(line: &str, max_cols: usize) -> String {
+    let trimmed = line.trim();
+    let len = trimmed.chars().count();
+    if len <= max_cols {
+        return trimmed.to_string();
+    }
+    if max_cols <= 3 {
+        return trimmed.chars().take(max_cols).collect();
+    }
+    let mut out: String = trimmed.chars().take(max_cols - 3).collect();
+    out.push_str("...");
+    out
+}
+
+fn build_oled_lines(outputs: &[CheckOutput]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for output in outputs {
+        lines.push(format!("[{}]", output.title));
+        lines.extend(output.lines.iter().cloned());
+    }
+
+    let mut filtered = Vec::new();
+    for line in lines {
+        if filtered.len() >= OLED_MAX_LINES {
+            break;
+        }
+        let trimmed = truncate_line(&line, OLED_MAX_COLS);
+        if !trimmed.is_empty() {
+            filtered.push(trimmed);
+        }
+    }
+
+    if filtered.is_empty() {
+        filtered.push("no data".to_string());
+    }
+
+    filtered
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -827,16 +1008,27 @@ async fn main() -> Result<()> {
         None
     };
 
+    let mut oled = init_oled(&args)?;
     let ctx = CheckContext { args, localapi };
 
-    for (idx, check) in checks.iter().enumerate() {
-        let output = check.run(&ctx).await?;
-        if idx > 0 {
-            println!();
+    if ctx.args.continuous {
+        let interval = Duration::from_secs(ctx.args.interval_secs.max(1));
+        let mut ticker = time::interval(interval);
+        loop {
+            let outputs = run_checks(&checks, &ctx).await?;
+            print_outputs(&outputs);
+            if let Some(oled) = oled.as_mut() {
+                let oled_lines = build_oled_lines(&outputs);
+                oled.render_lines(&oled_lines)?;
+            }
+            ticker.tick().await;
         }
-        println!("== {} ==", output.title);
-        for line in output.lines {
-            println!("{}", line);
+    } else {
+        let outputs = run_checks(&checks, &ctx).await?;
+        print_outputs(&outputs);
+        if let Some(oled) = oled.as_mut() {
+            let oled_lines = build_oled_lines(&outputs);
+            oled.render_lines(&oled_lines)?;
         }
     }
 
